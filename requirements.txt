@@ -1,0 +1,5 @@
+ipykernel
+tensorboard
+seaborn
+httpx[socks]
+httpcore[socks]
