@@ -21,7 +21,7 @@ import functools
 from typing import Any, Dict, Tuple
 
 # Install ml_collections on colab
-from ml_collections import ConfigDict
+#from ml_collections import ConfigDict
 
 # Type aliases
 PyTree = Any
@@ -30,25 +30,25 @@ Metrics = Dict[str, Tuple[jax.Array, ...]]
 from utils.single_gpu import Batch, TrainState, accumulate_gradients, print_metrics
 
 class MLPBlock(nn.Module):
-    config: ConfigDict
+    config: dict
     train: bool
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
         input_features = x.shape[-1]
-        x = nn.LayerNorm(dtype=self.config.dtype, name="pre_norm")(x)
+        x = nn.LayerNorm(dtype=self.config['dtype'], name="pre_norm")(x)
         x = nn.Dense(
-            features=self.config.mlp_expansion * input_features,
-            dtype=self.config.dtype,
+            features=self.config['mlp_expansion'] * input_features,
+            dtype=self.config['dtype'],
             name="input_layer",
         )(x)
         x = nn.gelu(x)
         x = nn.Dense(
             features=input_features,
-            dtype=self.config.dtype,
+            dtype=self.config['dtype'],
             name="output_layer",
         )(x)
-        x = nn.Dropout(rate=self.config.dropout_rate, deterministic=not self.train)(x)
+        #x = nn.Dropout(rate=self.config['dropout_rate'], deterministic=not self.train)(x)
         return x
     
 def dot_product_attention(
@@ -91,32 +91,32 @@ def dot_product_attention(
     return new_vals
 
 class AttentionBlock(nn.Module):
-    config: ConfigDict
+    config: dict
     mask: jax.Array | None
     train: bool
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
         input_features = x.shape[-1]
-        x = nn.LayerNorm(dtype=self.config.dtype, name="pre_norm")(x)
+        x = nn.LayerNorm(dtype=self.config['dtype'], name="pre_norm")(x)
         qkv = nn.DenseGeneral(
-            features=(self.config.num_heads, self.config.head_dim * 3),
-            dtype=self.config.dtype,
+            features=(self.config['num_heads'], self.config['head_dim'] * 3),
+            dtype=self.config['dtype'],
             name="qkv",
         )(x)
         q, k, v = jnp.split(qkv, 3, axis=-1)
-        x = dot_product_attention(q, k, v, mask=self.mask, softmax_dtype=self.config.softmax_dtype)
+        x = dot_product_attention(q, k, v, mask=self.mask, softmax_dtype=self.config['softmax_dtype'])
         x = nn.DenseGeneral(
             features=input_features,
             axis=(-2, -1),
-            dtype=self.config.dtype,
+            dtype=self.config['dtype'],
             name="output_layer",
         )(x)
-        x = nn.Dropout(rate=self.config.dropout_rate, deterministic=not self.train)(x)
+        #x = nn.Dropout(rate=self.config['dropout_rate'], deterministic=not self.train)(x)
         return x
     
 class TransformerBlock(nn.Module):
-    config: ConfigDict
+    config: dict
     mask: jax.Array | None
     train: bool
 
@@ -124,69 +124,85 @@ class TransformerBlock(nn.Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         # MLP block
         mlp = MLPBlock
-        if "MLP" in self.config.remat:
+        if "MLP" in self.config['remat']:
             mlp = nn.remat(mlp, prevent_cse=False)
         x = x + mlp(config=self.config, train=self.train, name="mlp")(x)
         # Attention block
         attn = AttentionBlock
-        if "Attn" in self.config.remat:
+        if "Attn" in self.config['remat']:
             attn = nn.remat(attn, prevent_cse=False)
         x = x + attn(config=self.config, mask=self.mask, train=self.train, name="attn")(x)
         return x
 
 class Transformer(nn.Module):
-    config: ConfigDict
+    config: dict
 
     @nn.compact
     def __call__(
         self, n: jax.Array, mask: jax.Array | None = None, train: bool = True
     ) -> jax.Array:
-        if mask is None and self.config.causal_mask:
+        if mask is None and self.config['causal_mask']:
             mask = nn.make_causal_mask(n, dtype=jnp.bool_)
-        # Input layer.
-        x = nn.Embed(
-            num_embeddings=self.config.vocab_size,
-            features=self.config.hidden_size,
-            dtype=self.config.dtype,
-            name="embed",
-        )(n)
-        pos_emb = self.param(
-            "pos_emb",
-            nn.initializers.normal(stddev=0.02),
-            (self.config.max_seq_len, self.config.hidden_size),
-        )
-        pos_emb = pos_emb.astype(self.config.dtype)
-        x = x + pos_emb[None, : x.shape[1]]
-        # Transformer blocks.
-        block_fn = functools.partial(TransformerBlock, config=self.config, mask=mask, train=train)
-        if "Block" in self.config.remat:
-            block_fn = nn.remat(block_fn, prevent_cse=False)
-        if self.config.scan_layers:
-            block = block_fn(name="block")
-            x, _ = nn.scan(
-                lambda module, carry, _: (module(carry), None),
-                variable_axes={"params": 0},
-                split_rngs={"params": True, "dropout": True},
-                length=self.config.num_layers,
-            )(block, x, ())
+        ### Initial Input.
+        if self.config['do_emb']:
+            x = nn.Embed(
+                num_embeddings=self.config['vocab_size'],
+                features=self.config['embedding_size'],
+                dtype=self.config['dtype'],
+                name="embed",
+            )(n)
         else:
-            for l_idx in range(self.config.num_layers):
-                x = block_fn(name=f"block_{l_idx}")(x)
-        # Output layer.
-        x = nn.LayerNorm(dtype=self.config.dtype, name="post_norm")(x)
+            x = n.astype(self.config['dtype'])
+        ### Positional embedding.
+        if self.config['do_pos_emb']:
+            pos_emb = self.param(
+                "pos_emb",
+                nn.initializers.normal(stddev=0.02),
+                (self.config['max_seq_len'], self.config['embedding_size']),
+            )
+            pos_emb = pos_emb.astype(self.config['dtype'])
+            x = x + pos_emb[None, : x.shape[1]]
+        ### Linear mixing.
+        if self.config['do_mix']:
+            batch_size = x.shape[0]
+            x = nn.DenseGeneral(
+                features=self.config['max_seq_len']*self.config['hidden_size'],
+                dtype=self.config['dtype'],
+                name="mix",
+            )(x.reshape(batch_size, -1))
+            x = nn.tanh(x)
+            #x = x.reshape(batch_size, self.config['max_seq_len'], self.config['hidden_size'])
+        ### Transformer blocks.
+        if self.config['num_layers'] != 0:
+            block_fn = functools.partial(TransformerBlock, config=self.config, mask=mask, train=train)
+            if "Block" in self.config['remat']:
+                block_fn = nn.remat(block_fn, prevent_cse=False)
+            if self.config['scan_layers']:
+                block = block_fn(name="block")
+                x, _ = nn.scan(
+                    lambda module, carry, _: (module(carry), None),
+                    variable_axes={"params": 0},
+                    split_rngs={"params": True, "dropout": True},
+                    length=self.config['num_layers'],
+                )(block, x, ())
+            else:
+                for l_idx in range(self.config['num_layers']):
+                    x = block_fn(name=f"block_{l_idx}")(x)
+        ### Output layer.
+        #x = nn.LayerNorm(dtype=self.config['dtype'], name="post_norm")(x)  # This line is useful!
         x = nn.Dense(
-            features=self.config.num_outputs,
-            dtype=self.config.dtype,
+            features=self.config['num_outputs']*self.config['max_seq_len'], # This line is used for test!
+            dtype=self.config['dtype'],
             name="output_layer",
         )(x)
-        
-        # Determinant layer
-        x = x.astype(self.config.out_dtype)
-        if self.config.determinant:
-            filling = self.config.num_outputs
+        # This line is used for test!
+        x = x.reshape(batch_size, self.config['max_seq_len'], self.config['num_outputs'])
+        x = x.astype(self.config['out_dtype'])
+        ### Determinant layer
+        if self.config['do_det']:
             @partial(jnp.vectorize, signature='(n),(n,m)->()')
             def logdet(n, out):
-                R =  n.nonzero(size = filling)[0]
+                R =  n.nonzero(size = self.config['num_outputs'])[0]
                 A = out[R]
                 return nkjax.logdet_cmplx(A)
             x = logdet(n, x)
